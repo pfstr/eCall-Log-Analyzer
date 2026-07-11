@@ -81,11 +81,19 @@ $LogFile    = Join-Path $ShareFolder ('logs\logfile_{0}.txt' -f (Get-Date -Forma
 $LockFile   = Join-Path $LockFolder ('Check_{0}{1}.txt' -f $Jahr, $Monat)
 $ReportFile = Join-Path $ReportingFolder ('{0}_SMS_FAX_{1}{2}.csv' -f $ServiceName, $Jahr, $Monat)
 
-# Spaltenkoepfe der eCall-Logfiles (Dateien werden ohne Kopfzeile geliefert)
+# Spaltenkoepfe der eCall-Logfiles gemaess F24/eCall-Spezifikation "Datenfelder
+# bei der Logfile-Zustellung" v1.4. Die Dateien werden Semikolon-getrennt und
+# OHNE Kopfzeile geliefert; die Zuordnung erfolgt daher rein ueber die Position.
+#
+# ACHTUNG: Die Meldungsfelder (OUT Feld 3 "Meldung"; IN Felder 3+4 "Gesendete"/
+# "Empfangene Meldung") koennen von eCall auf Wunsch unterdrueckt werden. Werden
+# dabei ganze Spalten entfernt, verschieben sich alle folgenden Felder und die
+# Verrechnung liest falsche Spalten. Diese Header setzen voraus, dass ALLE Spalten
+# geliefert werden (leere Werte sind ok). Details siehe README.md.
 $OutHeader = 'Referenz', 'Startdatum', 'Meldung', 'Resultatcode', 'Absender',
              'Empfaengernummer', 'ExterneID', 'Punkte', 'Empfaengername'
 $InHeader  = 'Referenz', 'Startdatum', 'GesendeteMeldung', 'EmpfangeneMeldung', 'Resultatcode',
-             'Empfaengernummer', 'eCallNummer', 'AntwortAdresse', 'AntwortInfo', 'ExterneID', 'Punkte'
+             'SendeAdresse', 'eCallAdresse', 'AntwortAdresse', 'AntwortInfo', 'ExterneID', 'Punkte'
 
 #endregion
 

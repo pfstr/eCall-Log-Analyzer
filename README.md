@@ -164,7 +164,31 @@ Ein eingebauter **Monats-Lock** (`Check_<JJJJMM>.txt` im `$LockFolder`) verhinde
 | WARN `Kein Logfile fuer Account..._...` | eCall-Mail noch nicht eingetroffen oder Dateinamensmuster in `$LogFileMap` passt nicht |
 | Hohe Menge auf dem Default-Eintrag | Erwartet für alles Unzuordenbare — im Tageslogfile stehen die betroffenen Buchungstexte |
 
+## Logfile-Format (eCall/F24-Spezifikation v1.4)
+
+Die Logfiles kommen als **ZIP-komprimierte, semikolongetrennte CSV-Dateien ohne Kopfzeile**; die Spalten werden rein über ihre Position zugeordnet. Das Script erwartet exakt diese Reihenfolge:
+
+| # | Out-Logfile | In-Logfile |
+|---|---|---|
+| 1 | Referenz | Referenz |
+| 2 | Startdatum | Startdatum |
+| 3 | Meldung *(optional)* | Gesendete Meldung *(optional)* |
+| 4 | Resultatcode | Empfangene Meldung *(optional)* |
+| 5 | **Absender** | Resultatcode |
+| 6 | Empfängernummer | Sende-Adresse |
+| 7 | **ExterneID** | eCall-Adresse |
+| 8 | **Punkte** | **Antwort-Adresse** |
+| 9 | Empfängername | Antwort-Info |
+| 10 | | **ExterneID** |
+| 11 | | **Punkte** |
+
+Fett markiert sind die für die Verrechnung ausgewerteten Felder.
+
+> **Achtung — unterdrückbare Meldungsfelder.** Die Meldungsspalten (Out-Feld 3, In-Felder 3 + 4) enthalten den SMS-/FAX-Klartext bzw. die Antworten und können bei eCall „auf Wunsch unterdrückt" werden. Das ist aus **Datenschutzsicht sinnvoll** (sonst liegt personenbezogener Nachrichteninhalt im Postfach und auf den File-Shares). Da die Zuordnung aber positionsbasiert ist, gilt: Klärt mit dem eCall-Support ab, dass eine Unterdrückung die **Spalte leer lässt und nicht entfernt** — nur dann bleibt die Feldreihenfolge stabil. Wird eine Spalte komplett entfernt, verschieben sich alle folgenden Felder und die Verrechnung liest falsche Werte. In diesem Fall müssen `$OutHeader` / `$InHeader` im Script angepasst werden.
+
 ## Hinweise zur Verrechnungslogik
 
 - Zeilen, die **sowohl** eine Absender-/Antwortadresse **als auch** eine `ExterneID` enthalten, werden in beiden Durchgängen gebucht. Die Schlusskontrolle gleicht die Gesamtsumme über den Default-Eintrag wieder aus, die einzelnen Kostenstellen wären in diesem Fall aber überzeichnet. Bei eCall ist pro Meldungstyp üblicherweise nur eines der Felder gefüllt.
 - Punktedifferenzen zwischen Logfile-Summe und verrechneter Summe werden immer auf den Default-Eintrag gebucht und im Log ausgewiesen — das Verrechnungsfile geht in der Gesamtsumme also immer auf.
+- Verrechnet wird ausschliesslich über das **Punkte-Feld** (verbrauchte Punktzahl je Auftrag), unabhängig vom `Resultatcode`. Das entspricht der eCall-Logik, bei der nur tatsächlich abgerechnete Aufträge Punkte tragen; fehlgeschlagene oder wartende Meldungen fliessen mit ihrem jeweiligen Punktewert (i. d. R. 0) ein.
+- Wurden in einem Monat keine Meldungen versendet bzw. empfangen, liefert eCall statt Datenzeilen einen Hinweistext im Logfile. Eine solche Zeile hat keine gültige Absender-/Antwortadresse und keinen numerischen Punktewert und wird von der Verrechnung automatisch ignoriert.
