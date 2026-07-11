@@ -1,725 +1,434 @@
-$hostname = hostname
-$month = (get-date).AddMonths(-1).ToString("MM")
-$lastmonthfull = (get-date).AddMonths(-1).ToString("Y")
-$year = (get-date).AddMonths(-1).Year
-$DDMMYYY = Get-Date -format dd.MM.yyyy
+#requires -Version 5.1
 
-# SMTP / Mail settings (anonymized)
-$smtpServer = "mail.example.com" # SMTP Server
-$smtpFrom   = "reporting@example.com" # Sender
-$smtpTo     = "recipient@example.com" # Recipient of report mails
+<#
+.SYNOPSIS
+    Monatliche Verrechnung der eCall SMS/FAX-Logfiles (Microsoft Graph).
 
-$messageSubject = "SERVICE_XYZ SMS FAX $lastmonthfull"
-$securitycheck  = "false"
-$message        = $null
-$UnknownDomains = @()
-$Zuweisungsgruppe = "IT-SUPPORT-GROUP" # Ticket assignment group
+.DESCRIPTION
+    Verarbeitet die von eCall per E-Mail zugestellten monatlichen Logfiles
+    (Format: https://help.ecall-messaging.com/de/article/logfiles-1fa1qpk/):
 
-# Destination folder (anonymized shares)
-$sourcefolder     = "D:\Temp\SCRIPTS\Log_Analyzer"
-$sharefolder      = "\\FILESERVER01\Source"
-$destinationFolder = "\\FILESERVER01\Source\Import"
-$ReportingFolder   = "\\FILESERVER01\Source\Verrechnungsfiles"
+      1. ZIP-Anhaenge per Microsoft Graph aus dem Postfach herunterladen und entpacken
+      2. In-/Out-Logfiles der beiden eCall-Accounts einlesen
+      3. Punkte anhand der Stammdaten auf Kostenstellen/Innenauftraege verrechnen
+         - Account 1: Zuordnung ueber die vollstaendige Absender-/Antwortadresse
+         - Account 2: Zuordnung ueber die Maildomain
+         - Zusaetzlich: Zuordnung ueber ExterneID (API-Meldungen) sowie
+           Sammelposition "eCallURL"
+      4. Nicht zuordenbare Restpunkte auf den Default-Eintrag buchen
+      5. Verrechnungs-CSV erzeugen und Report-Mail via Graph versenden
 
-# Log function 
-$logfile = "{0}\{1}{2}{3}" -f $sharefolder, "\logs\logfile_", (Get-Date -Format "yyyyMMdd"), ".txt"
-$logfilecheck = test-path $logfile
+    Authentifizierung: App-Only (Entra-App-Registrierung + Zertifikat).
+    Einrichtung siehe README.md.
 
-if ($logfilecheck -ne "true") {
-    new-item $logfile -itemtype file
+.PARAMETER Force
+    Fuehrt das Skript aus, auch wenn es in diesem Monat bereits gelaufen ist.
+
+.NOTES
+    Benoetigte Module : Microsoft.Graph.Authentication, Microsoft.Graph.Mail,
+                        Microsoft.Graph.Users.Actions
+    Benoetigte Rechte : Mail.ReadWrite, Mail.Send (Application, per
+                        ApplicationAccessPolicy auf die Postfaecher eingeschraenkt)
+#>
+[CmdletBinding()]
+param(
+    [switch]$Force
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+#region Konfiguration ----------------------------------------------------------
+
+# Entra ID / Microsoft Graph (App-Only-Authentifizierung, siehe README.md)
+$TenantId            = '00000000-0000-0000-0000-000000000000'
+$GraphClientId       = '00000000-0000-0000-0000-000000000000'
+$GraphCertThumbprint = '0000000000000000000000000000000000000000'
+
+$LogMailbox = 'ecall-logs@example.com'    # Postfach, in dem die eCall-Logfiles eintreffen
+$MailFrom   = 'reporting@example.com'     # Absenderpostfach der Report-Mail
+$MailTo     = 'recipient@example.com'     # Empfaenger der Report-Mail
+
+$SourceFolder    = 'D:\Temp\SCRIPTS\Log_Analyzer'          # Stammdaten.csv, Leistungsarten.csv
+$ShareFolder     = '\\FILESERVER01\Source'
+$ImportRoot      = '\\FILESERVER01\Source\Import'
+$ReportingFolder = '\\FILESERVER01\Source\Verrechnungsfiles'
+$LockFolder      = '\\FILESERVER01\Source\Check'           # Merker "diesen Monat bereits gelaufen"
+
+$DefaultBuchungstext = 'default.example.com'               # Auffangposition fuer Unzuordenbares
+$Zuweisungsgruppe    = 'IT-SUPPORT-GROUP'
+$ServiceName         = 'SERVICE_XYZ'
+
+# Erwartete Logfiles und ihre Zuordnung zu den vier Datensaetzen
+$LogFileMap = @(
+    @{ Pattern = 'Account1_*_Out-LogFile.txt'; Key = 'Account1_Out'; Richtung = 'Out' }
+    @{ Pattern = 'Account1_*_In-LogFile.txt';  Key = 'Account1_In';  Richtung = 'In'  }
+    @{ Pattern = 'Account2_*_Out-LogFile.txt'; Key = 'Account2_Out'; Richtung = 'Out' }
+    @{ Pattern = 'Account2_*_In-LogFile.txt';  Key = 'Account2_In';  Richtung = 'In'  }
+)
+
+#endregion
+
+#region Abgeleitete Werte ------------------------------------------------------
+
+$Vormonat  = (Get-Date).AddMonths(-1)
+$Monat     = $Vormonat.ToString('MM')
+$Jahr      = $Vormonat.Year
+$MonatLang = $Vormonat.ToString('Y')                        # z.B. "Juni 2026"
+$Heute     = Get-Date -Format 'dd.MM.yyyy'
+
+$LogFile    = Join-Path $ShareFolder ('logs\logfile_{0}.txt' -f (Get-Date -Format 'yyyyMMdd'))
+$LockFile   = Join-Path $LockFolder ('Check_{0}{1}.txt' -f $Jahr, $Monat)
+$ReportFile = Join-Path $ReportingFolder ('{0}_SMS_FAX_{1}{2}.csv' -f $ServiceName, $Jahr, $Monat)
+
+# Spaltenkoepfe der eCall-Logfiles (Dateien werden ohne Kopfzeile geliefert)
+$OutHeader = 'Referenz', 'Startdatum', 'Meldung', 'Resultatcode', 'Absender',
+             'Empfaengernummer', 'ExterneID', 'Punkte', 'Empfaengername'
+$InHeader  = 'Referenz', 'Startdatum', 'GesendeteMeldung', 'EmpfangeneMeldung', 'Resultatcode',
+             'Empfaengernummer', 'eCallNummer', 'AntwortAdresse', 'AntwortInfo', 'ExterneID', 'Punkte'
+
+#endregion
+
+#region Funktionen -------------------------------------------------------------
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO', 'WARN', 'ERROR', 'FATAL', 'DEBUG')][string]$Level = 'INFO'
+    )
+    $line = '{0} {1,-5} {2}' -f (Get-Date -Format 'yyyy/MM/dd HH:mm:ss'), $Level, $Message
+    Add-Content -Path $LogFile -Value $line
+    $farbe = if ($Level -in 'ERROR', 'FATAL') { 'Red' } elseif ($Level -eq 'WARN') { 'Yellow' } else { 'Green' }
+    Write-Host $line -ForegroundColor $farbe
 }
 
-Function write-log {
-    [CmdletBinding()]
-    Param(
-        [Parameter(Mandatory=$False)]
-        [ValidateSet("INFO","WARN","ERROR","FATAL","DEBUG")]
-        [String]
-        $Level = "INFO",
+function Get-MailDomain {
+    # Liefert den Domainteil einer Mailadresse (leerzeichenbereinigt), sonst $null.
+    param([string]$Adresse)
+    (($Adresse -replace '\s', '') -split '@')[1]
+}
 
-        [Parameter(Mandatory=$True)]
-        [String]
-        $Message
+function Get-PunkteSumme {
+    param($Zeilen)
+    $summe = ($Zeilen | Measure-Object -Property Punkte -Sum).Sum
+    if ($null -eq $summe) { [decimal]0 } else { [decimal]$summe }
+}
+
+function Add-Verrechnungspunkte {
+    # Bucht Punkte auf den Stammdaten-Eintrag mit passendem Buchungstext;
+    # ohne Treffer auf den Default-Eintrag.
+    param(
+        [Parameter(Mandatory)][string]$Buchungstext,
+        [Parameter(Mandatory)][decimal]$Punkte
+    )
+    if ($Punkte -eq 0) { return }
+
+    $eintrag = $script:StammdatenIndex[$Buchungstext]
+    if (-not $eintrag) {
+        Write-Log -Level WARN -Message "Kein Stammdaten-Eintrag fuer '$Buchungstext' - $Punkte Punkte gehen auf '$DefaultBuchungstext'"
+        $eintrag = $script:DefaultEintrag
+    }
+    $eintrag.Menge += $Punkte
+    Write-Log -Message ('{0}: {1} Punkte (KST {2}, IA {3}, KA {4}, Pos {5})' -f
+        $Buchungstext, $Punkte, $eintrag.Kostenstelle, $eintrag.Innenauftrag, $eintrag.Kundenauftrag, $eintrag.Auftragsposition)
+}
+
+function Import-ECallLogFile {
+    param(
+        [Parameter(Mandatory)][string]$Pfad,
+        [Parameter(Mandatory)][ValidateSet('In', 'Out')][string]$Richtung
+    )
+    $header = if ($Richtung -eq 'Out') { $script:OutHeader } else { $script:InHeader }
+    Import-Csv -Path $Pfad -Delimiter ';' -Header $header | ForEach-Object {
+        $_.Punkte = if ($_.Punkte) { [decimal]$_.Punkte } else { [decimal]0 }
+        $_
+    }
+}
+
+function Get-GraphLogAttachments {
+    # Laedt alle ZIP-Anhaenge aus dem Posteingang des Log-Postfachs, entpackt sie
+    # pro Mail in einen eigenen Unterordner und verschiebt verarbeitete Mails in
+    # "Geloeschte Elemente".
+    param(
+        [Parameter(Mandatory)][string]$Zielordner
     )
 
-    $Stamp = (Get-Date).toString("yyyy/MM/dd HH:mm:ss")
-    $Line  = "$Stamp $Level $Message"
-    Add-Content -Path $logfile -Value $Line
-    write-host $line -foregroundcolor green
-}
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-# Master data - CSV import
+    $mailNr = 0
+    $maxDurchlaeufe = 50
+    do {
+        $maxDurchlaeufe--
+        $messages = @(Get-MgUserMessage -UserId $LogMailbox -Top 100 `
+            -Property id, subject, receivedDateTime, from, hasAttachments)
+        Write-Log -Message "$($messages.Count) Mails im Posteingang gefunden"
 
-$Stammdaten = @{}
-$Stammdaten = Import-Csv -path "$sourcefolder\Stammdaten.csv" -Delimiter ";"
-write-log -message "Stammdaten.csv wurde eingelesen"
-$Stammdaten = [Collections.Generic.List[Object]]$Stammdaten
-$Countingtable = Import-Csv -path "$sourcefolder\Stammdaten.csv" -Delimiter ";" | select Innenauftrag, Kostenstelle, Kundenauftrag, Auftragsposition -unique
-$Countingtable | Add-Member -MemberType NoteProperty -Name Punkte -value 0
+        foreach ($msg in $messages) {
+            $mailNr++
+            $mailOrdner = Join-Path $Zielordner $mailNr
+            New-Item -Path $mailOrdner -ItemType Directory | Out-Null
 
-$Nichtverrechenbar = @{}
+            try {
+                Write-Log -Message "Mail $mailNr - $($msg.Subject)"
 
-# Check if the script has already been executed this month
-if ($securitycheck -eq "true") {
-    $pathcheck = test-path "\\FILESERVER02\Source\Check\Check_$year$month.txt"
-    if ($pathcheck -eq "true") {
-        write-log -message "The script has already been executed this month. If you want to overrule this check, change the value of the ""securitycheck"" variable in the script settings to anything else than ""true""." -level "ERROR"
-        Write-EventLog -LogName "Application" -Source "Application Error" -EventID 1 -Message "The billing script has already been executed this month. If you want to overrule this check, change the value of the ""securitycheck"" variable in the script settings to anything else than ""true""." -EntryType Error
-        throw "The script has already been executed this month. If you want to overrule this check, change the value of the ""securitycheck"" variable in the script settings to anything else than ""true""."
-    } 
-    new-item "\\FILESERVER02\Source\Check\Check_$year$month.txt" -itemtype file
-}
-	
-# Credentials (anonymized / empty placeholders)
-$email    = ""
-$username = ""
-$password = ""
- 
-# File extensions to download
-$extensions = "zip"
- 
-# load the assembly
-Add-Type -Path "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll"
+                # Metadaten der Mail zur Nachvollziehbarkeit ablegen
+                [ordered]@{
+                    Subject          = $msg.Subject
+                    ReceivedDateTime = $msg.ReceivedDateTime
+                    From             = $msg.From.EmailAddress.Address
+                } | ConvertTo-Json | Set-Content -Path (Join-Path $mailOrdner 'metadata.json')
 
-# Load unzip function from System.IO.Compression.ZipFile
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-function Unzip {
-    param([string]$zipfile, [string]$outpath)
-    [System.IO.Compression.ZipFile]::ExtractToDirectory($zipfile, $outpath)
-}
+                $anhaenge = @(Get-MgUserMessageAttachment -UserId $LogMailbox -MessageId $msg.Id |
+                    Where-Object {
+                        $_.AdditionalProperties['@odata.type'] -eq '#microsoft.graph.fileAttachment' -and
+                        $_.Name -like '*.zip'
+                    })
 
-# Create Exchange Service object
-$s = New-Object Microsoft.Exchange.WebServices.Data.ExchangeService([Microsoft.Exchange.WebServices.Data.ExchangeVersion]::Exchange2016)
-$s.Credentials = New-Object Net.NetworkCredential($username, $password)
-$s.TraceEnabled = $true
-write-log -message "Trying AutoDiscover... "
-$s.AutodiscoverUrl($email, {$true})
- 
-if(!$s.Url) {
-    Write-Log -message "AutoDiscover failed" -level "ERROR"
-    Write-Error "AutoDiscover failed"
-    return;
-} else {
-    write-log -message "AutoDiscover succeeded - $($s.Url)"
-}
- 
-# Create destination folder
-$destinationFolder = "{0}\{1}" -f $destinationFolder, (Get-Date -Format "yyyyMMdd HHmmss")
-mkdir $destinationFolder | Out-Null
- 
-# get a handle to the inbox
-$inbox = [Microsoft.Exchange.WebServices.Data.Folder]::Bind($s,[Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Inbox)
- 
-#create a property set (to let us access the body & other details not available from the FindItems call)
-$psPropertySet = new-object Microsoft.Exchange.WebServices.Data.PropertySet([Microsoft.Exchange.WebServices.Data.BasePropertySet]::FirstClassProperties)
-$psPropertySet.RequestedBodyType = [Microsoft.Exchange.WebServices.Data.BodyType]::Text;
- 
-# Find the items
-$inc = 0;
-$maxRepeat = 50;
-do {
-    $maxRepeat -= 1;
- 
-    write-log -message "Searching for items in mailbox... "
-    $items = $inbox.FindItems(100)
-    write-log -message "found $($items.items.Count) items in the inbox"
- 
-    foreach ($item in $items.Items) {
-        # Create mail folder
-        $inc += 1
-        $mailFolder = "{0}\{1}" -f $destinationFolder, $inc;
-        mkdir $mailFolder | Out-Null
- 
-        # load the property set to allow us to get to the body
-        try {
-            $item.load($psPropertySet)
-            write-log -message ("$inc - $($item.Subject)")
- 
-            # save the metadata to a file
-            $item | Export-Clixml ("{0}\metadata.xml" -f $mailFolder)
- 
-            # save all attachments
-            foreach($attachment in $item.Attachments) {
-                if(($attachment.Name -split "\." | select -last 1) -in $extensions) {
-                    $fileName = ("{0}\{1}" -f $mailFolder, $attachment.Name) -replace "/",""
-                    write-log -message "File has been downloaded: $filename - $([Math]::Round($attachment.Size / 1024))KB"
-                    $attachment.Load($fileName)
-					
-                    # Extract files		
-                    Try {
-                        write-log -message "Unzipping $filename"
-                        Unzip $filename $mailfolder 
-                    } catch [Exception] {
-                        Write-Log -message "Unable to extract item: $filename" -level "ERROR"
-                        Write-Error "Unable to extract item: $filename"
+                foreach ($att in $anhaenge) {
+                    $zipDatei = Join-Path $mailOrdner ($att.Name -replace '/', '')
+
+                    # Rohinhalt streamen statt Base64 aus der Auflistung - funktioniert
+                    # auch bei grossen Anhaengen zuverlaessig
+                    $uri = 'https://graph.microsoft.com/v1.0/users/{0}/messages/{1}/attachments/{2}/$value' -f
+                        $LogMailbox, $msg.Id, $att.Id
+                    Invoke-MgGraphRequest -Method GET -Uri $uri -OutputFilePath $zipDatei
+                    Write-Log -Message ('Anhang gespeichert: {0} ({1} KB)' -f $zipDatei, [Math]::Round($att.Size / 1KB))
+
+                    try {
+                        [System.IO.Compression.ZipFile]::ExtractToDirectory($zipDatei, $mailOrdner)
+                    }
+                    catch {
+                        Write-Log -Level ERROR -Message "Entpacken fehlgeschlagen: $zipDatei - $_"
                     }
                 }
+
+                # Verarbeitete Mail in "Geloeschte Elemente" verschieben
+                Move-MgUserMessage -UserId $LogMailbox -MessageId $msg.Id `
+                    -DestinationId 'deleteditems' | Out-Null
             }
- 
-            # delete the mail item
-            $item.Delete([Microsoft.Exchange.WebServices.Data.DeleteMode]::SoftDelete, $true)
-            write-log -message "Moving processed items to the mailbox dumpster"
-        } catch [Exception] {
-            Write-Log -message "Unable to load item: $($_)" -level "ERROR"
-            Write-Error "Unable to load item: $($_)"
-        }	
-	
-        # CSV Import
-	
-        $searchinfolder = Get-ChildItem $mailFolder *.txt
-        if ($searchinfolder.name -like "Account1_*_Out-LogFile.txt") {
-            write-log -message "Einlesen von CSV für OUT-File von Account ACCOUNT1 wurde gestartet"
-            $Account1_Out_Logfile = @()
-            $Account1_Out_Logfile | Add-Member -MemberType NoteProperty -Name Punkte -value 0		
-            $Account1_Out_LogFile = Import-Csv `
-                -path "$mailfolder\Account1_*_Out-LogFile.txt" `
-                -Delimiter ";"`
-                -header "Referenz","Startdatum","Meldung","Resultatcode","Absender","Empfaengernummer","ExterneID","Punkte","Empfaengername" `
-                | Select @{Name="Referenz";Expression={[decimal]$_.Referenz}}, @{Name="Startdatum";Expression={[datetime]$_.Startdatum}}, Meldung, `
-                @{Name="Resultatcode";Expression={[decimal]$_.Resultatcode}}, Absender, @{Name="Empfaengernummer";Expression={[decimal]$_.Empfaengernummer}}, `
-                ExterneID , @{Name="Punkte";Expression={[decimal]$_.Punkte}}, Empfaengername
-								
-            write-log -message "CSV für OUT-File von Account ACCOUNT1 wurde eingelesen"
-        }	
-		
-        if ($searchinfolder.name -like "Account1_*_In-LogFile.txt") {
-            write-log -message "Einlesen von CSV für IN-File von Account ACCOUNT1 wurde gestartet"
-            $Account1_In_Logfile = @()
-            $Account1_In_Logfile | Add-Member -MemberType NoteProperty -Name Punkte -value 0
-            $Account1_In_LogFile = Import-Csv `
-                -path "$mailfolder\Account1_*_In-LogFile.txt" `
-                -Delimiter ";"`
-                -header "Referenz","Startdatum","GesendeteMeldung","EmpfangeneMeldung","Resultatcode","Empfaengernummer","eCallNummer","AntwortAdresse","AntwortInfo","ExterneID","Punkte" `
-                | Select @{Name="Referenz";Expression={[decimal]$_.Referenz}}, @{Name="Startdatum";Expression={[datetime]$_.Startdatum}}, GesendeteMeldung, `
-                EmpfangeneMeldung, @{Name="Resultatcode";Expression={[decimal]$_.Resultatcode}}, @{Name="Empfaengernummer";Expression={[decimal]$_.Empfaengernummer}}, `
-                @{Name="eCallNummer";Expression={[decimal]$_.ecallNummer}} , Antwortadresse, Antwortinfo, ExterneID, @{Name="Punkte";Expression={[decimal]$_.Punkte}}	
-								
-            write-log -message "CSV für IN-File von Account ACCOUNT1 wurde eingelesen"
+            catch {
+                Write-Log -Level ERROR -Message "Mail konnte nicht verarbeitet werden: $_"
+            }
         }
-		
-        if ($searchinfolder.name -like "Account2_*_Out-LogFile.txt") {
-            write-log -message "Einlesen von CSV für OUT-File von Account ACCOUNT2 wurde gestartet"
-            $Account2_Out_LogFile = @()
-            $Account2_Out_LogFile | Add-Member -MemberType NoteProperty -Name Punkte -value 0
-            $Account2_Out_LogFile = Import-Csv `
-                -path "$mailfolder\Account2_*_Out-LogFile.txt" `
-                -Delimiter ";"`
-                -header "Referenz","Startdatum","Meldung","Resultatcode","Absender","Empfaengernummer","ExterneID","Punkte","Empfaengername" `
-                | Select @{Name="Referenz";Expression={[decimal]$_.Referenz}}, @{Name="Startdatum";Expression={[datetime]$_.Startdatum}}, Meldung, `
-                @{Name="Resultatcode";Expression={[decimal]$_.Resultatcode}}, Absender, @{Name="Empfaengernummer";Expression={[decimal]$_.Empfaengernummer}}, `
-                ExterneID , @{Name="Punkte";Expression={[decimal]$_.Punkte}}, Empfaengername
-								
-            write-log -message "CSV für OUT-File von Account ACCOUNT2 wurde eingelesen"
-        }
-		
-        if ($searchinfolder.name -like "Account2_*_In-LogFile.txt") {
-            write-log -message "Einlesen von CSV für IN-File von Account ACCOUNT2 wurde gestartet"
-            $Account2_In_LogFile = @()
-            $Account2_In_LogFile | Add-Member -MemberType NoteProperty -Name Punkte -value 0
-            $Account2_In_LogFile = Import-Csv `
-                -path "$mailfolder\Account2_*_In-LogFile.txt" `
-                -Delimiter ";"`
-                -header "Referenz","Startdatum","GesendeteMeldung","EmpfangeneMeldung","Resultatcode","Empfaengernummer","eCallNummer","AntwortAdresse","AntwortInfo","ExterneID","Punkte" `
-                | Select @{Name="Referenz";Expression={[decimal]$_.Referenz}}, @{Name="Startdatum";Expression={[datetime]$_.Startdatum}}, GesendeteMeldung, `
-                EmpfangeneMeldung, @{Name="Resultatcode";Expression={[decimal]$_.Resultatcode}}, @{Name="Empfaengernummer";Expression={[decimal]$_.Empfaengernummer}}, `
-                @{Name="eCallNummer";Expression={[decimal]$_.ecallNummer}} , Antwortadresse, Antwortinfo, ExterneID, @{Name="Punkte";Expression={[decimal]$_.Punkte}}	
-																
-            write-log -message "CSV für IN-File von Account ACCOUNT2 wurde eingelesen"
+    } while ($messages.Count -eq 100 -and $maxDurchlaeufe -gt 0)
+}
+
+function Send-ReportMail {
+    param(
+        [Parameter(Mandatory)][string]$Subject,
+        [Parameter(Mandatory)][string]$HtmlBody,
+        [string[]]$Attachments = @()
+    )
+
+    $mailAttachments = foreach ($pfad in $Attachments) {
+        @{
+            '@odata.type' = '#microsoft.graph.fileAttachment'
+            name          = Split-Path $pfad -Leaf
+            contentBytes  = [Convert]::ToBase64String([IO.File]::ReadAllBytes($pfad))
         }
     }
-} while($items.MoreAvailable -and $maxRepeat -ge 0)
 
-# Import Leistungsarten
-
-$Leistungsarten = Import-Csv -path "$sourcefolder\Leistungsarten.csv" -Delimiter ";"
-write-log -message "Leistungsarten.csv wurde eingelesen"
-
-# Start sender / reply-address logic
-
-$Account1_Absender = $Account1_Out_LogFile | select Absender -unique | where-object {$_.Absender -ne ""}
-$Account1_Antwortadresse = $Account1_In_LogFile | select AntwortAdresse -unique | where-object {$_.AntwortAdresse -ne ""}
-
-$Account2_Absender = $Account2_Out_LogFile | select Absender -unique | where-object {$_.Absender -ne ""}
-$Account2_Domain_Out =  foreach ($item in $Account2_Absender.Absender) {($item -replace '\s','' -split '@')[1]}
-$Account2_Domain_Out_Unique = $Account2_Domain_Out | select -unique
-
-$Account2_Antwortadresse = $Account2_In_LogFile | select Antwortadresse -unique # keep empty addresses as well
-$Account2_Domain_In =  foreach ($item in $Account2_Antwortadresse.Antwortadresse) {($item -replace '\s','' -split '@')[1]}
-$Account2_Domain_In_Unique = $Account2_Domain_In | select -unique
-$Account2_Domain_In_Unique += "" # include empty domain for checking
-
-# Account1 sender
-
-foreach ($Account1_Absender_Unique_Out in $Account1_Absender) {
-    write-host $Account1_Absender_Unique_Out.Absender
-	
-    $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq $Account1_Absender_Unique_Out.Absender} )
-	
-    if ($Index -eq "-1") {
-        $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq "default.example.com"} )
+    $body = @{
+        message         = @{
+            subject      = $Subject
+            body         = @{ contentType = 'HTML'; content = $HtmlBody }
+            toRecipients = @(@{ emailAddress = @{ address = $MailTo } })
+            attachments  = @($mailAttachments)
+        }
+        saveToSentItems = $true
     }
-	
-    $Punkte = ""		
-    $Punkte = [Linq.Enumerable]::Sum(
-        [decimal[]] (
-            $Account1_Out_LogFile | where {$_.Absender -eq $Account1_Absender_Unique_Out.Absender}
-        ).Punkte
-    )
-    $Kostenstelle   = $Stammdaten[$Index].Kostenstelle
-    $Innenauftrag   = $Stammdaten[$Index].Innenauftrag
-    $Kundenauftrag  = $Stammdaten[$Index].Kundenauftrag
-    $Auftragsposition = $Stammdaten[$Index].Auftragsposition
-	
-    write-host $Innenauftrag
-    write-host $Kostenstelle
-    write-host $Kundenauftrag
-    write-host $Auftragsposition
-    $Stammdaten[$Index].Menge = $Punkte + $Stammdaten[$Index].Menge
-    write-host $Punkte
+
+    Send-MgUserMail -UserId $MailFrom -BodyParameter $body
 }
 
-foreach ($Account1_Antwortadresse_Unique_In in $Account1_Antwortadresse) {
-    write-host $Account1_Antwortadresse_Unique_In.AntwortAdresse
-	
-    $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq $Account1_Antwortadresse_Unique_In.AntwortAdresse} )
-	
-    if ($Index -eq "-1") {
-        $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq "default.example.com"} )
+#endregion
+
+#region Hauptablauf ------------------------------------------------------------
+
+# Logdatei sicherstellen
+$logDir = Split-Path $LogFile -Parent
+if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory | Out-Null }
+if (-not (Test-Path $LogFile)) { New-Item -Path $LogFile -ItemType File | Out-Null }
+
+$graphVerbunden = $false
+try {
+    Write-Log -Message "=== Start Verrechnung $ServiceName fuer $MonatLang ==="
+
+    # Doppelausfuehrung im selben Monat verhindern
+    if (Test-Path $LockFile) {
+        if (-not $Force) {
+            $meldung = "Das Verrechnungsskript wurde diesen Monat bereits ausgefuehrt ($LockFile). Erneuter Lauf nur mit -Force."
+            Write-Log -Level ERROR -Message $meldung
+            Write-EventLog -LogName Application -Source 'Application Error' -EventId 1 -EntryType Error -Message $meldung
+            throw $meldung
+        }
+        Write-Log -Level WARN -Message 'Monats-Check per -Force uebersteuert'
     }
-	
-    $Punkte = ""
-    $Punkte = [Linq.Enumerable]::Sum(
-        [decimal[]] (
-            $Account1_In_LogFile | where {$_.Antwortadresse -eq $Account1_Antwortadresse_Unique_In.AntwortAdresse}
-        ).Punkte
+    New-Item -Path $LockFile -ItemType File -Force | Out-Null
+
+    # Stammdaten einlesen, Menge als Dezimalwert initialisieren
+    $Stammdaten = @(Import-Csv -Path (Join-Path $SourceFolder 'Stammdaten.csv') -Delimiter ';')
+    foreach ($eintrag in $Stammdaten) {
+        if ($eintrag.PSObject.Properties['Menge']) {
+            $eintrag.Menge = if ($eintrag.Menge) { [decimal]$eintrag.Menge } else { [decimal]0 }
+        }
+        else {
+            $eintrag | Add-Member -MemberType NoteProperty -Name Menge -Value ([decimal]0)
+        }
+    }
+    Write-Log -Message "Stammdaten.csv eingelesen ($($Stammdaten.Count) Eintraege)"
+
+    # Index Buchungstext -> Eintrag (bei Duplikaten gewinnt der erste)
+    $StammdatenIndex = @{}
+    foreach ($eintrag in $Stammdaten) {
+        if (-not $StammdatenIndex.ContainsKey($eintrag.Buchungstext)) {
+            $StammdatenIndex[$eintrag.Buchungstext] = $eintrag
+        }
+    }
+
+    $DefaultEintrag = $StammdatenIndex[$DefaultBuchungstext]
+    if (-not $DefaultEintrag) { throw "Default-Eintrag '$DefaultBuchungstext' fehlt in den Stammdaten" }
+
+    $Leistungsarten = @(Import-Csv -Path (Join-Path $SourceFolder 'Leistungsarten.csv') -Delimiter ';')
+    Write-Log -Message 'Leistungsarten.csv eingelesen'
+
+    # Graph-Verbindung (App-Only mit Zertifikat)
+    Import-Module Microsoft.Graph.Authentication, Microsoft.Graph.Mail, Microsoft.Graph.Users.Actions
+    Connect-MgGraph -TenantId $TenantId -ClientId $GraphClientId `
+        -CertificateThumbprint $GraphCertThumbprint -NoWelcome
+    $graphVerbunden = $true
+    Write-Log -Message "Mit Microsoft Graph verbunden (App $GraphClientId)"
+
+    # Logfiles aus dem Postfach abholen
+    $importFolder = Join-Path $ImportRoot (Get-Date -Format 'yyyyMMdd HHmmss')
+    New-Item -Path $importFolder -ItemType Directory | Out-Null
+    Get-GraphLogAttachments -Zielordner $importFolder
+
+    # Entpackte Logfiles den vier Datensaetzen zuordnen und einlesen
+    $Logs = @{}
+    foreach ($map in $LogFileMap) { $Logs[$map.Key] = @() }
+
+    foreach ($datei in Get-ChildItem -Path $importFolder -Recurse -Filter '*.txt') {
+        $map = $LogFileMap | Where-Object { $datei.Name -like $_.Pattern } | Select-Object -First 1
+        if (-not $map) {
+            Write-Log -Level WARN -Message "Unbekanntes Logfile wird ignoriert: $($datei.Name)"
+            continue
+        }
+        $Logs[$map.Key] += @(Import-ECallLogFile -Pfad $datei.FullName -Richtung $map.Richtung)
+        Write-Log -Message "$($datei.Name) eingelesen ($($map.Key), gesamt $($Logs[$map.Key].Count) Zeilen)"
+    }
+
+    foreach ($map in $LogFileMap) {
+        if ($Logs[$map.Key].Count -eq 0) {
+            Write-Log -Level WARN -Message "Kein Logfile fuer $($map.Key) gefunden"
+        }
+    }
+
+    # --- Verrechnung nach Absender / Antwortadresse -----------------------------
+
+    Write-Log -Message 'Verrechnung Account 1 (Zuordnung ueber Mailadresse)'
+    $Logs.Account1_Out | Where-Object { $_.Absender } | Group-Object -Property Absender | ForEach-Object {
+        Add-Verrechnungspunkte -Buchungstext $_.Name -Punkte (Get-PunkteSumme $_.Group)
+    }
+    $Logs.Account1_In | Where-Object { $_.AntwortAdresse } | Group-Object -Property AntwortAdresse | ForEach-Object {
+        Add-Verrechnungspunkte -Buchungstext $_.Name -Punkte (Get-PunkteSumme $_.Group)
+    }
+
+    Write-Log -Message 'Verrechnung Account 2 (Zuordnung ueber Maildomain)'
+    $Logs.Account2_Out | Where-Object { $_.Absender } | Group-Object -Property { Get-MailDomain $_.Absender } | ForEach-Object {
+        $key = if ($_.Name) { $_.Name } else { $DefaultBuchungstext }
+        Add-Verrechnungspunkte -Buchungstext $key -Punkte (Get-PunkteSumme $_.Group)
+    }
+    # Beim In-File zaehlen auch Zeilen ohne Antwortadresse - sie gehen auf den Default-Eintrag
+    $Logs.Account2_In | Group-Object -Property { Get-MailDomain $_.AntwortAdresse } | ForEach-Object {
+        $key = if ($_.Name) { $_.Name } else { $DefaultBuchungstext }
+        Add-Verrechnungspunkte -Buchungstext $key -Punkte (Get-PunkteSumme $_.Group)
+    }
+
+    # --- Verrechnung nach ExterneID (API-Meldungen) -----------------------------
+
+    foreach ($key in $LogFileMap.Key) {
+        Write-Log -Message "Verrechnung ExterneID ($key)"
+
+        $Logs[$key] |
+            Where-Object { $_.ExterneID -and $_.ExterneID -notlike '*ecallURL*' } |
+            Group-Object -Property ExterneID | ForEach-Object {
+                Add-Verrechnungspunkte -Buchungstext $_.Name -Punkte (Get-PunkteSumme $_.Group)
+            }
+
+        # eCall-URL-Meldungen laufen gesammelt auf die Position "eCallURL"
+        $urlPunkte = Get-PunkteSumme ($Logs[$key] | Where-Object { $_.ExterneID -like 'eCallURL*' })
+        Add-Verrechnungspunkte -Buchungstext 'eCallURL' -Punkte $urlPunkte
+    }
+
+    # --- Kontrollsummen und Restpunkte ------------------------------------------
+
+    $PunkteJe = @{}
+    foreach ($key in $LogFileMap.Key) { $PunkteJe[$key] = Get-PunkteSumme $Logs[$key] }
+
+    $PunkteAccount1 = $PunkteJe['Account1_Out'] + $PunkteJe['Account1_In']
+    $PunkteAccount2 = $PunkteJe['Account2_Out'] + $PunkteJe['Account2_In']
+    $Gesamtpunkte   = $PunkteAccount1 + $PunkteAccount2
+
+    $VerrechnetePunkte = [decimal](($Stammdaten | Measure-Object -Property Menge -Sum).Sum)
+    $Differenz = $Gesamtpunkte - $VerrechnetePunkte
+    Write-Log -Message "Gesamtpunkte laut Logfiles: $Gesamtpunkte / verrechnet: $VerrechnetePunkte / Differenz: $Differenz"
+
+    # Nicht zugeordnete Restpunkte auf den Default-Eintrag buchen
+    if ($Differenz -ne 0) {
+        $DefaultEintrag.Menge += $Differenz
+        Write-Log -Message "Restdifferenz von $Differenz Punkten auf '$DefaultBuchungstext' gebucht"
+    }
+
+    $Kontrolle = $Gesamtpunkte - [decimal](($Stammdaten | Measure-Object -Property Menge -Sum).Sum)
+    if ($Kontrolle -ne 0) {
+        Write-Log -Level ERROR -Message "Kontrollsumme geht nicht auf (Restdifferenz $Kontrolle)"
+    }
+
+    # --- Verrechnungsfile erzeugen ----------------------------------------------
+
+    $kopfzeilen = @(
+        'SKST;XXXX Communication Services'
+        'Modul;XXXXXX SMS/FAX'
+        "Erstellung;$Heute"
+        'Leistungsart;Leistungsgroessen'
     )
-	
-    $Kostenstelle   = $Stammdaten[$Index].Kostenstelle
-    $Innenauftrag   = $Stammdaten[$Index].Innenauftrag
-    $Kundenauftrag  = $Stammdaten[$Index].Kundenauftrag
-    $Auftragsposition = $Stammdaten[$Index].Auftragsposition
-	
-    write-host $Innenauftrag
-    write-host $Kostenstelle
-    write-host $Kundenauftrag
-    write-host $Auftragsposition
-    $Stammdaten[$Index].Menge = $Punkte + $Stammdaten[$Index].Menge
-    write-host $Punkte
-}	
-	
-foreach ($Account2_Domain_Out_SingleItem in $Account2_Domain_Out_Unique) {
-    write-host $Account2_Domain_Out_SingleItem
-	
-    $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq $Account2_Domain_Out_SingleItem} )
-	
-    if ($Index -eq "-1") {
-        $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq "default.example.com"} )
-    }
-	
-    $Punkte = ""	
-    $Punkte = [Linq.Enumerable]::Sum(
-        [decimal[]] (
-            $Account2_Out_LogFile | where {$_.Absender -like "*$Account2_Domain_Out_SingleItem*"}
-        ).Punkte
-    )
-	
-    $Kostenstelle   = $Stammdaten[$Index].Kostenstelle
-    $Innenauftrag   = $Stammdaten[$Index].Innenauftrag
-    $Kundenauftrag  = $Stammdaten[$Index].Kundenauftrag
-    $Auftragsposition = $Stammdaten[$Index].Auftragsposition
-	
-    write-host $Innenauftrag
-    write-host $Kostenstelle
-    write-host $Kundenauftrag
-    write-host $Auftragsposition
-    $Stammdaten[$Index].Menge = $Punkte + $Stammdaten[$Index].Menge
-    write-host $Punkte
-}
-		
-foreach ($Account2_Domain_In_SingleItem in $Account2_Domain_In_Unique) {
-    write-host $Account2_Domain_In_SingleItem
-	
-    $Index = $Stammdaten.findindex( {$args[0].Antwortadresse -eq $Account2_Domain_Out_SingleItem} )
-		
-    if ($Index -eq "-1") {
-        $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq "default.example.com"} )
-    }
-		
-    if ($Account2_Domain_In_SingleItem -ne "") {
-        $Punkte = ""
-        $Punkte = [Linq.Enumerable]::Sum(
-            [decimal[]] (
-                $Account2_In_LogFile | where {$_.Antwortadresse -like "*$Account2_Domain_In_SingleItem*"}
-            ).Punkte
-        )
-        $Stammdaten[$Index].Menge = $Punkte + $Stammdaten[$Index].Menge
-			
-        $Kostenstelle   = $Stammdaten[$Index].Kostenstelle
-        $Innenauftrag   = $Stammdaten[$Index].Innenauftrag
-        $Kundenauftrag  = $Stammdaten[$Index].Kundenauftrag
-        $Auftragsposition = $Stammdaten[$Index].Auftragsposition
-		
-        write-host $Innenauftrag
-        write-host $Kostenstelle
-        write-host $Kundenauftrag
-        write-host $Auftragsposition
-        write-host $Punkte
-			
-    } else {
-        write-host $Account2_Domain_In_SingleItem
-        $Punkte = ""
-        $Punkte = [Linq.Enumerable]::Sum(
-            [decimal[]] (
-                $Account2_In_LogFile | where {$_.Antwortadresse -eq ""}
-            ).Punkte
-        )
-        $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq "default.example.com"} )		
-		
-        $Stammdaten[$Index].Menge = $Punkte + $Stammdaten[$Index].Menge
-			
-        $Kostenstelle   = $Stammdaten[$Index].Kostenstelle
-        $Innenauftrag   = $Stammdaten[$Index].Innenauftrag
-        $Kundenauftrag  = $Stammdaten[$Index].Kundenauftrag
-        $Auftragsposition = $Stammdaten[$Index].Auftragsposition
-		
-        write-host $Innenauftrag
-        write-host $Kostenstelle
-        write-host $Kundenauftrag
-        write-host $Auftragsposition
-        write-host $Punkte
-    }
-}
-		
-# Start ExterneID billing
+    $kopfzeilen += $Leistungsarten | ForEach-Object { '{0};{1}' -f $_.Leistungsart, $_.Bezeichnung }
 
-$Account1_ExterneID_Out = $Account1_Out_LogFile | select ExterneID -unique | where-object {$_.ExterneID -ne "" -and $_.ExterneID -notlike "*ecallURL*"}
-$Account1_ExterneID_In  = $Account1_In_LogFile  | select ExterneID -unique | where-object {$_.ExterneID -ne "" -and $_.ExterneID -notlike "*ecallURL*"}
+    Set-Content -Path $ReportFile -Value $kopfzeilen -Encoding UTF8
+    $Stammdaten | ConvertTo-Csv -Delimiter ';' -NoTypeInformation | Add-Content -Path $ReportFile -Encoding UTF8
+    Write-Log -Message "Verrechnungsfile erstellt: $ReportFile"
 
-$Account2_ExterneID_Out = $Account2_Out_LogFile | select ExterneID -unique | where-object {$_.ExterneID -ne "" -and $_.ExterneID -notlike "*ecallURL*"}
-$Account2_ExterneID_In  = $Account2_In_LogFile  | select ExterneID -unique | where-object {$_.ExterneID -ne "" -and $_.ExterneID -notlike "*ecallURL*"}
+    # --- Report-Mail versenden ---------------------------------------------------
 
-foreach ($Account1_ExterneID_Unique_Out in $Account1_ExterneID_Out) {
-    write-host $Account1_ExterneID_Unique_Out.ExterneID -foregroundcolor green
-		
-    $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq $Account1_ExterneID_Unique_Out.ExterneID} )
-		
-    if ($Index -eq "-1") {
-        $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq "default.example.com"} )
-    }
-		
-    $Punkte = ""
-    $Punkte = [Linq.Enumerable]::Sum(
-        [decimal[]] (
-            $Account1_Out_LogFile | where {$_.ExterneID -eq $Account1_ExterneID_Unique_Out.ExterneID}
-        ).Punkte
-    )
-		
-    $Kostenstelle   = $Stammdaten[$Index].Kostenstelle
-    $Innenauftrag   = $Stammdaten[$Index].Innenauftrag
-    $Kundenauftrag  = $Stammdaten[$Index].Kundenauftrag
-    $Auftragsposition = $Stammdaten[$Index].Auftragsposition
-		
-    write-host $Innenauftrag
-    write-host $Kostenstelle
-    write-host $Kundenauftrag
-    write-host $Auftragsposition
-    $Stammdaten[$Index].Menge = $Punkte + $Stammdaten[$Index].Menge
-    write-host $Punkte
-}
-		
-# eCall URL points add (Account1_Out_LogFile)		
-write-host "eCallURL Addition" -foregroundcolor yellow
-		
-$Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq "eCallURL"} )
-$Punkte = ""
-$Punkte = [Linq.Enumerable]::Sum(
-    [decimal[]] (
-        $Account1_Out_LogFile | where {$_.ExterneID -like "eCallURL*"}
-    ).Punkte
-)
-		
-$Kostenstelle   = $Stammdaten[$Index].Kostenstelle
-$Innenauftrag   = $Stammdaten[$Index].Innenauftrag
-$Kundenauftrag  = $Stammdaten[$Index].Kundenauftrag
-$Auftragsposition = $Stammdaten[$Index].Auftragsposition
-		
-write-host $Innenauftrag
-write-host $Kostenstelle
-write-host $Kundenauftrag
-write-host $Auftragsposition
-write-host $Punkte
-$Stammdaten[$Index].Menge = $Punkte + $Stammdaten[$Index].Menge
-
-foreach ($Account1_ExterneID_Unique_In in $Account1_ExterneID_In) {
-    write-host $Account1_ExterneID_Unique_In.ExterneID -foregroundcolor green
-		
-    $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq $Account1_ExterneID_Unique_In.ExterneID} )
-		
-    if ($Index -eq "-1") {
-        $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq "default.example.com"} )
-    }
-		
-    $Punkte = ""
-    $Punkte = [Linq.Enumerable]::Sum(
-        [decimal[]] (
-            $Account1_In_LogFile | where {$_.ExterneID -eq $Account1_ExterneID_Unique_In.ExterneID}
-        ).Punkte
-    )
-		
-    $Kostenstelle   = $Stammdaten[$Index].Kostenstelle
-    $Innenauftrag   = $Stammdaten[$Index].Innenauftrag
-    $Kundenauftrag  = $Stammdaten[$Index].Kundenauftrag
-    $Auftragsposition = $Stammdaten[$Index].Auftragsposition
-		
-    write-host $Innenauftrag
-    write-host $Kostenstelle
-    write-host $Kundenauftrag
-    write-host $Auftragsposition
-    $Stammdaten[$Index].Menge = $Punkte + $Stammdaten[$Index].Menge
-    write-host $Punkte
-}
-
-# eCall URL points add (Account1_In_LogFile)	
-write-host "eCallURL Addition" -foregroundcolor yellow
-		
-$Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq "eCallURL"} )
-$Punkte = ""
-$Punkte = [Linq.Enumerable]::Sum(
-    [decimal[]] @(
-        $Account1_In_LogFile | where {$_.ExterneID -like "eCallURL*"}
-    ).Punkte
-)
-		
-$Kostenstelle   = $Stammdaten[$Index].Kostenstelle
-$Innenauftrag   = $Stammdaten[$Index].Innenauftrag
-$Kundenauftrag  = $Stammdaten[$Index].Kundenauftrag
-$Auftragsposition = $Stammdaten[$Index].Auftragsposition
-		
-write-host $Innenauftrag
-write-host $Kostenstelle
-write-host $Kundenauftrag
-write-host $Auftragsposition
-$Stammdaten[$Index].Menge = $Punkte + $Stammdaten[$Index].Menge
-write-host $Punkte		
-	
-foreach ($Account2_ExterneID_Unique_Out in $Account2_ExterneID_Out) {
-    write-host $Account2_ExterneID_Unique_Out.ExterneID -foregroundcolor green
-		
-    $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq $Account2_ExterneID_Unique_Out.ExterneID} )
-		
-    if ($Index -eq "-1") {
-        $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq "default.example.com"} )
-    }
-		
-    $Punkte = ""		
-    $Punkte = [Linq.Enumerable]::Sum(
-        [decimal[]] (
-            $Account2_Out_LogFile | where {$_.ExterneID -eq $Account2_ExterneID_Unique_Out.ExterneID}
-        ).Punkte
-    )
-
-    $Kostenstelle   = $Stammdaten[$Index].Kostenstelle
-    $Innenauftrag   = $Stammdaten[$Index].Innenauftrag
-    $Kundenauftrag  = $Stammdaten[$Index].Kundenauftrag
-    $Auftragsposition = $Stammdaten[$Index].Auftragsposition
-		
-    write-host $Innenauftrag
-    write-host $Kostenstelle
-    write-host $Kundenauftrag
-    write-host $Auftragsposition
-    $Stammdaten[$Index].Menge = $Punkte + $Stammdaten[$Index].Menge
-    write-host $Punkte
-}
-
-# eCall URL points add (Account2_Out_LogFile)	
-write-host "eCallURL Addition" -foregroundcolor yellow
-		
-$Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq "eCallURL"} )
-$Punkte = ""
-$Punkte = [Linq.Enumerable]::Sum(
-    [decimal[]] @(
-        $Account2_Out_LogFile | where {$_.ExterneID -like "eCallURL*"}
-    ).Punkte
-)
-		
-$Kostenstelle   = $Stammdaten[$Index].Kostenstelle
-$Innenauftrag   = $Stammdaten[$Index].Innenauftrag
-$Kundenauftrag  = $Stammdaten[$Index].Kundenauftrag
-$Auftragsposition = $Stammdaten[$Index].Auftragsposition
-		
-write-host $Innenauftrag
-write-host $Kostenstelle
-write-host $Kundenauftrag
-write-host $Auftragsposition
-$Stammdaten[$Index].Menge = $Punkte + $Stammdaten[$Index].Menge
-write-host $Punkte		
-	
-foreach ($Account2_ExterneID_Unique_In in $Account2_ExterneID_In) {
-    write-host $Account2_ExterneID_Unique_In.ExterneID -foregroundcolor green
-		
-    $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq $Account2_ExterneID_Unique_In.ExterneID} )
-		
-    if ($Index -eq "-1") {
-        $Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq "default.example.com"} )
-    }
-		
-    $Punkte = ""		
-    $Punkte = [Linq.Enumerable]::Sum(
-        [decimal[]] (
-            $Account2_In_LogFile | where {$_.ExterneID -eq $Account2_ExterneID_Unique_In.ExterneID}
-        ).Punkte
-    )
-		
-    $Kostenstelle   = $Stammdaten[$Index].Kostenstelle
-    $Innenauftrag   = $Stammdaten[$Index].Innenauftrag
-    $Kundenauftrag  = $Stammdaten[$Index].Kundenauftrag
-    $Auftragsposition = $Stammdaten[$Index].Auftragsposition
-		
-    write-host $Innenauftrag
-    write-host $Kostenstelle
-    write-host $Kundenauftrag
-    write-host $Auftragsposition
-    $Stammdaten[$Index].Menge = $Punkte + $Stammdaten[$Index].Menge
-    write-host $Punkte
-}
-	
-# eCall URL points add (Account2_In_LogFile)	
-write-host "eCallURL Addition" -foregroundcolor yellow
-		
-$Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq "eCallURL"} )
-$Punkte = ""
-$Punkte = [Linq.Enumerable]::Sum(
-    [decimal[]] @(
-        $Account2_In_LogFile | where {$_.ExterneID -like "eCallURL*"}
-    ).Punkte
-)
-		
-$Kostenstelle   = $Stammdaten[$Index].Kostenstelle
-$Innenauftrag   = $Stammdaten[$Index].Innenauftrag
-$Kundenauftrag  = $Stammdaten[$Index].Kundenauftrag
-$Auftragsposition = $Stammdaten[$Index].Auftragsposition
-		
-write-host $Innenauftrag
-write-host $Kostenstelle
-write-host $Kundenauftrag
-write-host $Auftragsposition
-$Stammdaten[$Index].Menge = $Punkte + $Stammdaten[$Index].Menge
-write-host $Punkte		
-	
-# Total points checks
-
-$GesamtpunkteAccount1Out = [Linq.Enumerable]::Sum(
-    [decimal[]] (
-        $Account1_Out_LogFile
-    ).Punkte
-)		
-
-$GesamtpunkteAccount1In = [Linq.Enumerable]::Sum(
-    [decimal[]] (
-        $Account1_In_LogFile
-    ).Punkte
-)		
-
-$GesamtpunkteAccount2In = [Linq.Enumerable]::Sum(
-    [decimal[]] (
-        $Account2_In_LogFile
-    ).Punkte
-)		
-		
-$GesamtpunkteAccount2Out = [Linq.Enumerable]::Sum(
-    [decimal[]] (
-        $Account2_Out_LogFile
-    ).Punkte
-)	
-		
-$Gesamtpunkte = $GesamtpunkteAccount1Out + $GesamtpunkteAccount1In + $GesamtpunkteAccount2In + $GesamtpunkteAccount2Out
-$PunktzahlAccount1 = $GesamtpunkteAccount1Out + $GesamtpunkteAccount1In
-$PunktezahlAccount2 = $GesamtpunkteAccount2Out + $GesamtpunkteAccount2In
-
-write-host $Gesamtpunkte -foregroundcolor yellow
-		
-# Compare with script points
-		
-$Scriptpunkte = [Linq.Enumerable]::Sum(
-    [decimal[]] (
-        $Stammdaten
-    ).Menge
-)	
-		
-write-host $Scriptpunkte -foregroundcolor yellow
-
-$stammdaten | ft
-
-$Punktedifferenz = $Gesamtpunkte - $Scriptpunkte
-
-write-host "Punktedifferenz: $Punktedifferenz" -foregroundcolor yellow
-		
-# Assign difference to default.example.com
-
-$Index = $Stammdaten.findindex( {$args[0].Buchungstext -eq "default.example.com"} )		
-$Stammdaten[$Index].Menge = $Punktedifferenz + $Stammdaten[$Index].Menge
-
-$Scriptpunkte = [Linq.Enumerable]::Sum(
-    [decimal[]] (
-        $Stammdaten
-    ).Menge
-)	
-
-$PunktedifferenzNEU = $Gesamtpunkte - $Scriptpunkte
-
-write-host "Punktedifferenz NEU: $PunktedifferenzNEU" -foregroundcolor green
-
-# Billing CSV "metadata" header
-new-item "$reportingfolder\SERVICE_XYZ_SMS_FAX_$year$month.csv" -itemtype file -force -value "SKST;XXXX Communication Services
-Modul;XXXXXX SMS/FAX
-Erstellung;$DDMMYYY
-Leistungsart;Leistungsgroessen
-$($Leistungsarten.Leistungsart[0]);$($Leistungsarten.Bezeichnung[0])
-$($Leistungsarten.Leistungsart[1]);$($Leistungsarten.Bezeichnung[1])
-$($Leistungsarten.Leistungsart[2]);$($Leistungsarten.Bezeichnung[2])
-$($Leistungsarten.Leistungsart[3]);$($Leistungsarten.Bezeichnung[3])
-"
-
-$Stammdaten | Export-Csv "$reportingfolder\Temp\Stammdaten_$year$month.csv" ";" -NoTypeInformation
-$Stammdaten_Werte = get-content "$reportingfolder\Temp\Stammdaten_$year$month.csv"
-
-# Append data rows to billing CSV
-add-content -Path "$reportingfolder\SERVICE_XYZ_SMS_FAX_$year$month.csv" -Value $Stammdaten_Werte
-
-# Build HTML mail body (anonymized)
-$messagebody = 
-"<h1 style='color: #5e9ca0;'>SERVICE_XYZ Periode <span style='color: #2b2301;'>$lastmonthfull</span></h1>
-<h2 style='color: #2e6c80;'>Quick-Infos:</h2>
-<table style='height: 105px; width: 606px;' border='2'>
+    $mailBody = @"
+<h1 style="color:#5e9ca0;">$ServiceName Periode <span style="color:#2b2301;">$MonatLang</span></h1>
+<h2 style="color:#2e6c80;">Quick-Infos:</h2>
+<table style="width:606px;" border="2">
 <tbody>
-<tr>
-<td style='width: 265px;'><strong>Auslösedatum</strong></td>
-<td style='width: 337px;'>$DDMMYYY</td>
-</tr>
-<tr>
-<td style='width: 265px;'><strong>Generierender Server</strong></td>
-<td style='width: 337px;'>$hostname</td>
-</tr>
-<tr>
-<td style='width: 265px;'><strong>Punktezahl Gesamt</strong></td>
-<td style='width: 337px;'>$Gesamtpunkte</td>
-</tr>
-<tr>
-<td style='width: 265px;'><strong>Punktezahl Account&nbsp;ACCOUNT1</strong></td>
-<td style='width: 337px;'>$PunktzahlAccount1</td>
-</tr>
-<tr>
-<td style='width: 265px;'><strong>Punktezahl Account ACCOUNT2</strong></td>
-<td style='width: 337px;'>$PunktezahlAccount2</td>
-</tr>
-<tr>
-<td style='width: 265px;'><strong>Probleme?</strong></td>
-<td style='width: 337px;'>Bitte einen <a href='https://example.service-now.com/incident.do?sys_id=-1&amp;sysparm_query=active=true&amp;sysparm_stack=incident_list.do?sysparm_query=active=true'>Incident eröffnen</a>&nbsp;und der Zuweisungsgruppe $Zuweisungsgruppe zuweisen.</td>
-</tr>
+<tr><td style="width:265px;"><strong>Ausl&ouml;sedatum</strong></td><td style="width:337px;">$Heute</td></tr>
+<tr><td><strong>Generierender Server</strong></td><td>$env:COMPUTERNAME</td></tr>
+<tr><td><strong>Punktezahl Gesamt</strong></td><td>$Gesamtpunkte</td></tr>
+<tr><td><strong>Punktezahl Account ACCOUNT1</strong></td><td>$PunkteAccount1</td></tr>
+<tr><td><strong>Punktezahl Account ACCOUNT2</strong></td><td>$PunkteAccount2</td></tr>
+<tr><td><strong>Probleme?</strong></td>
+<td>Bitte einen <a href="https://example.service-now.com/incident.do?sys_id=-1&amp;sysparm_query=active=true">Incident er&ouml;ffnen</a>
+und der Zuweisungsgruppe $Zuweisungsgruppe zuweisen.</td></tr>
 </tbody>
 </table>
-<h2 style='color: #2e6c80;'>&nbsp;</h2>"
+"@
 
-# Sending Email
+    Send-ReportMail -Subject "$ServiceName SMS FAX $MonatLang" -HtmlBody $mailBody `
+        -Attachments $LogFile, $ReportFile
 
-Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $messageSubject -Body $messageBody -BodyAsHTML -SmtpServer $smtpServer -encoding UTF8 -attachments $logfile, "$reportingfolder\SERVICE_XYZ_SMS_FAX_$year$month.csv"
+    Write-Log -Message '=== Verrechnung abgeschlossen, Report-Mail versendet ==='
+}
+catch {
+    Write-Log -Level FATAL -Message "Abbruch: $_"
+    throw
+}
+finally {
+    if ($graphVerbunden) { Disconnect-MgGraph | Out-Null }
+}
+
+#endregion
