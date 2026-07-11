@@ -99,6 +99,8 @@ Alle Einstellungen stehen gebündelt im Block `#region Konfiguration` von [`bill
 
 ### 5. Eingabedateien
 
+Beide Dateien liegen im `$SourceFolder` auf dem Server (nicht im Repo). Als Vorlage mit dem exakten Format liegen sie unter [`examples/`](examples/) — die realen Dateien mit echten Kostenstellen und Mailadressen gehören **nicht** ins Repository (per `.gitignore` geschützt).
+
 **`Stammdaten.csv`** (Semikolon-getrennt, mit Kopfzeile) — die Zuordnungstabelle:
 
 ```csv

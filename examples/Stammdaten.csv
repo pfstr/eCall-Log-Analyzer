@@ -1,0 +1,8 @@
+Innenauftrag;Kostenstelle;Kundenauftrag;Auftragsposition;Buchungstext;Menge
+IA100001;KST5000;KA200001;10;alerting@example.com;0
+IA100002;KST5100;KA200002;10;monitoring@example.com;0
+IA100003;KST5200;KA200003;10;subdomain.example.com;0
+IA100004;KST5300;KA200004;10;abteilung-b.example.com;0
+IA100005;KST5400;KA200005;10;MeineExterneID;0
+IA100009;KST5900;KA200009;10;eCallURL;0
+IA100010;KST5999;KA200010;10;default.example.com;0

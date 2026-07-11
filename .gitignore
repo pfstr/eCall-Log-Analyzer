@@ -1,0 +1,8 @@
+# Reale Verrechnungs-Stammdaten niemals einchecken - nur die Vorlagen unter examples/
+/Stammdaten.csv
+/Leistungsarten.csv
+
+# Zertifikate / Secrets
+*.cer
+*.pfx
+*.pem
