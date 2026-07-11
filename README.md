@@ -4,6 +4,8 @@ PowerShell-Script zur monatlichen Verrechnung der [eCall SMS/FAX-Logfiles](https
 
 eCall stellt die Logfiles des Vormonats als ZIP-Anhang per E-Mail zu. Das Script holt diese Mails per **Microsoft Graph** aus einem dedizierten Postfach ab, liest die In-/Out-Logfiles beider eCall-Accounts ein, verrechnet die Punkte anhand einer Stammdaten-Tabelle und erzeugt daraus ein Verrechnungs-CSV. Zum Abschluss wird ein HTML-Report per Mail versendet.
 
+> **Wichtig — die Logfiles kommen nicht automatisch.** Der monatliche Versand der Logfiles muss beim [eCall-Support](https://www.ecall.ch/support/) aktiv beantragt werden. Erst wenn eCall die Einlieferung für die betroffenen Accounts eingerichtet hat, treffen die ZIP-Anhänge im konfigurierten Postfach ein. Ohne diese Freischaltung findet das Script keine Logfiles vor und meldet nur `WARN`-Zeilen.
+
 > **Warum Graph statt EWS?** Exchange Web Services (EWS) wird für Exchange Online am **1. Oktober 2026** abgeschaltet. Diese Version verwendet durchgängig Microsoft Graph mit App-Only-Authentifizierung (Zertifikat) — es werden keine Passwörter mehr im Script oder auf der Platte benötigt.
 
 ## Funktionsweise
